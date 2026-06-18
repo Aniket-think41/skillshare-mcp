@@ -31,8 +31,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller
-          # Install skillshare-cli first (MCP depends on its local-scan auth)
-          pip install skillshare-cli
+          # MCP depends on skillshare-cli for shared auth/local-scan. It is not on
+          # PyPI, so install it from its GitHub repo (keeps CI self-contained).
+          pip install "skillshare-cli @ git+https://github.com/Aniket-think41/skillshare-cli.git"
           pip install -e .
 
       - name: Build with PyInstaller
@@ -50,29 +51,6 @@ jobs:
         with:
           name: skillshare-mcp-${{ matrix.target }}
           path: dist/skillshare-mcp-*
-
-  publish-pypi:
-    name: Publish to PyPI
-    runs-on: ubuntu-latest
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    environment:
-      name: pypi
-      url: https://pypi.org/p/skillshare-mcp
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Build package
-        run: |
-          python -m pip install --upgrade pip build
-          python -m build
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
 
   release:
     name: Create Release
