@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skillshare-mcp"
+version = "1.0.0"
+description = "MCP server for the SkillShare registry"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Aniket Kumar", email = "aniket.lnu@think41.com"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific Engineering :: Artificial Intelligence",
+]
+keywords = ["skills", "mcp", "registry", "ai", "claude", "mcp-server"]
+dependencies = [
+    "mcp>=1.2",
+    "httpx>=0.27",
+    # shared auth + local-scan core (F2)
+    "skillshare-cli",
+]
+
+[project.urls]
+Source = "https://github.com/Aniket-think41/skillshare-mcp"
+BugTracker = "https://github.com/Aniket-think41/skillshare-mcp/issues"
+
+[project.scripts]
+skillshare-mcp = "skillshare_mcp.server:main"
+
+[tool.setuptools]
+packages = ["skillshare_mcp"]
