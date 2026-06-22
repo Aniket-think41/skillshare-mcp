@@ -34,6 +34,9 @@ jobs:
           # MCP depends on skillshare-cli for shared auth/local-scan. It is not on
           # PyPI, so install it from its GitHub repo (keeps CI self-contained).
           pip install "skillshare-cli @ git+https://github.com/Aniket-think41/skillshare-cli.git"
+          # Install the [cli] extra (typer) so PyInstaller's --collect-all mcp can
+          # import every mcp submodule (mcp.cli imports typer) without erroring.
+          pip install "mcp[cli]"
           pip install -e .
 
       # Build from the top-level run.py shim (NOT skillshare_mcp/server.py) so the
