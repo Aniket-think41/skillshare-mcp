@@ -36,13 +36,31 @@ jobs:
           pip install "skillshare-cli @ git+https://github.com/Aniket-think41/skillshare-cli.git"
           pip install -e .
 
+      # Build from the top-level run.py shim (NOT skillshare_mcp/server.py) so the
+      # whole package is bundled and imports resolve. --collect-all mcp pulls in the
+      # MCP framework's dynamically-imported submodules + data files (missed under
+      # --onefile otherwise); --collect-submodules covers our two packages.
       - name: Build with PyInstaller
         run: |
-          pyinstaller --onefile --name skillshare-mcp skillshare_mcp/server.py
+          pyinstaller --onefile --name skillshare-mcp \
+            --collect-all mcp \
+            --collect-submodules skillshare_mcp \
+            --collect-submodules skillshare_cli \
+            --collect-submodules truststore \
+            run.py
           if [ "${{ matrix.target }}" = "windows-amd64" ]; then
             mv dist/skillshare-mcp.exe dist/skillshare-mcp-windows-amd64.exe
           else
             mv dist/skillshare-mcp dist/skillshare-mcp-${{ matrix.target }}
+          fi
+        shell: bash
+
+      - name: Smoke-test the binary
+        run: |
+          if [ "${{ matrix.target }}" = "windows-amd64" ]; then
+            ./dist/skillshare-mcp-windows-amd64.exe --version
+          else
+            ./dist/skillshare-mcp-${{ matrix.target }} --version
           fi
         shell: bash
 
