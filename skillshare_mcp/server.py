@@ -137,6 +137,21 @@ def _summary(r: dict) -> dict:
     }
 
 
+def _resource_scope(org_slug: str, project_id: str, pod_id: str) -> dict:
+    """Resolve a resource scope from exactly one of org_slug / project_id /
+    pod_id. Most specific wins if several are (wrongly) passed. A resource is
+    inherited by everything beneath its scope and notifies that scope's
+    members."""
+    if pod_id:
+        return {"scope_type": "POD", "scope_id": pod_id}
+    if project_id:
+        return {"scope_type": "PROJECT", "scope_id": project_id}
+    if org_slug:
+        org = _request("GET", f"/api/orgs/{org_slug}")
+        return {"scope_type": "ORG", "scope_id": org["id"]}
+    raise SkillShareError("Provide a target scope: org_slug, project_id, or pod_id")
+
+
 # ---------- auth: browser device login ----------
 
 @mcp.tool()
@@ -370,16 +385,38 @@ def unfollow_org(org_slug: str) -> dict:
 
 @mcp.tool()
 def whoami() -> dict:
-    """Who am I authenticated as? (Requires SKILLSHARE_TOKEN.)"""
+    """Who am I authenticated as, and do I have unread inbox items? (Requires
+    SKILLSHARE_TOKEN.) `unread_notifications` counts skills/notes/MCP a teammate
+    added in a scope you belong to — call check_updates to see them."""
     u = _request("GET", "/api/auth/me")
-    return {"username": u["username"], "display_name": u["display_name"], "email": u["email"]}
+    try:
+        unread = (_request("GET", "/api/notifications/unread_count") or {}).get("count", 0)
+    except SkillShareError:
+        unread = 0
+    return {
+        "username": u["username"],
+        "display_name": u["display_name"],
+        "email": u["email"],
+        "is_publisher": u.get("is_publisher", False),
+        "unread_notifications": unread,
+    }
+
+
+def _org_terms(o: dict) -> dict:
+    """The org's Project/Pod labels (custom-terminology), defaulting to the
+    standard words. Use these when talking to the user so you mirror how their
+    org names the hierarchy (e.g. 'Team' instead of 'Pod')."""
+    term = o.get("terminology") or {}
+    return {"project": term.get("project") or "Project", "pod": term.get("pod") or "Pod"}
 
 
 @mcp.tool()
 def list_my_orgs() -> list[dict]:
-    """List organizations the authenticated user belongs to."""
+    """List organizations the authenticated user belongs to, including each org's
+    Project/Pod labels (`terminology`) so you can use the org's own wording."""
     return [
-        {"slug": o["slug"], "name": o["name"], "role": o["my_role"], "plan": o["plan"]}
+        {"slug": o["slug"], "name": o["name"], "role": o["my_role"], "plan": o["plan"],
+         "terminology": _org_terms(o)}
         for o in _request("GET", "/api/orgs")
     ]
 
@@ -387,7 +424,9 @@ def list_my_orgs() -> list[dict]:
 @mcp.tool()
 def list_org_structure(org_slug: str) -> dict:
     """List an org's projects and pods (ids + names), so you can target
-    list_pod_resources / create_note at the right scope."""
+    list_pod_resources / create_note at the right scope. Includes the org's
+    `terminology` (Project/Pod labels) — mirror those words to the user."""
+    org = _request("GET", f"/api/orgs/{org_slug}")
     projects = _request("GET", f"/api/orgs/{org_slug}/projects")
     out = []
     for p in projects:
@@ -399,7 +438,106 @@ def list_org_structure(org_slug: str) -> dict:
                 "pods": [{"pod_id": x["id"], "name": x["name"], "purpose": x["purpose_tag"]} for x in pods],
             }
         )
-    return {"org": org_slug, "projects": out}
+    return {"org": org_slug, "terminology": _org_terms(org), "projects": out}
+
+
+@mcp.tool()
+def update_org(
+    org_slug: str, name: str = "", description: str = "", project_label: str = "", pod_label: str = ""
+) -> dict:
+    """Rename an org or relabel its Projects/Pods (the org's "workspace naming").
+    Set name/description to rename the org; set project_label and/or pod_label to
+    change what "Project"/"Pod" are called org-wide (e.g. "Team"/"Squad").
+    Relabelling requires the org's custom-terminology (premium) feature; you must
+    be an org ADMIN. Only the fields you pass are changed."""
+    body: dict = {}
+    if name:
+        body["name"] = name
+    if description:
+        body["description"] = description
+    if project_label or pod_label:
+        current = _org_terms(_request("GET", f"/api/orgs/{org_slug}"))
+        body["terminology"] = {
+            "project": project_label or current["project"],
+            "pod": pod_label or current["pod"],
+        }
+    if not body:
+        raise SkillShareError("Pass name, description, project_label, or pod_label")
+    o = _request("PATCH", f"/api/orgs/{org_slug}", json=body)
+    return {"slug": o["slug"], "name": o["name"], "terminology": _org_terms(o)}
+
+
+# ---- member management (org / project / pod) ----
+# Roles everywhere are ADMIN | MEMBER. Exactly one scope (org_slug / project_id /
+# pod_id) identifies where to act. Adding by email auto-provisions a brand-new
+# teammate; adding at a deeper level cascades the shallower levels as MEMBER.
+
+
+def _members_path(org_slug: str, project_id: str, pod_id: str) -> tuple[str, str, str]:
+    chosen = [(k, v) for k, v in (("org", org_slug), ("project", project_id), ("pod", pod_id)) if v]
+    if len(chosen) != 1:
+        raise SkillShareError("Specify exactly one of org_slug, project_id, or pod_id")
+    kind, value = chosen[0]
+    if kind == "org":
+        return "org", f"/api/orgs/{value}/members", f"org {value}"
+    return kind, f"/api/{kind}s/{value}/members", f"{kind} {value}"
+
+
+def _norm_role(role: str) -> str:
+    return "ADMIN" if (role or "").strip().upper() in ("ADMIN", "OWNER", "LEAD") else "MEMBER"
+
+
+def _member_summary(m: dict) -> dict:
+    u = m.get("user") or {}
+    return {"user_id": m["user_id"], "role": m["role"],
+            "username": u.get("username"), "display_name": u.get("display_name"), "email": u.get("email")}
+
+
+@mcp.tool()
+def list_members(org_slug: str = "", project_id: str = "", pod_id: str = "") -> list[dict]:
+    """List the members (and their roles) of an org, project, or pod. Give
+    exactly one of org_slug / project_id / pod_id."""
+    _, path, _ = _members_path(org_slug, project_id, pod_id)
+    return [_member_summary(m) for m in (_request("GET", path) or [])]
+
+
+@mcp.tool()
+def add_member(email: str, org_slug: str = "", project_id: str = "", pod_id: str = "", role: str = "member") -> dict:
+    """Add a teammate by email to an org, project, or pod. Give exactly one of
+    org_slug / project_id / pod_id, and role="admin" or "member".
+
+    - If the email has no account yet, one is created and they're emailed a
+      temporary password (they set their own on first sign-in).
+    - Adding to a POD or PROJECT also makes them a MEMBER of the parent levels
+      (a pod ADMIN is still just an org/project MEMBER).
+    - For an ORG this sends an invitation (with an accept link).
+    """
+    kind, path, label = _members_path(org_slug, project_id, pod_id)
+    r = _norm_role(role)
+    if kind == "org":
+        inv = _request("POST", path.replace("/members", "/invite"), json={"email": email, "role": r})
+        return {"scope": label, "invited": inv["email"], "role": inv["role"]}
+    m = _request("POST", path, json={"email": email, "role": r})
+    return {"scope": label, "added": (m.get("user") or {}).get("email", email), "role": m["role"],
+            "cascaded": "parent project + org as MEMBER" if kind == "pod" else "org as MEMBER"}
+
+
+@mcp.tool()
+def set_member_role(user_id: str, role: str, org_slug: str = "", project_id: str = "", pod_id: str = "") -> dict:
+    """Change a member's role (admin | member) at a scope. Identify the member by
+    user_id (from list_members) and give exactly one scope."""
+    _, path, label = _members_path(org_slug, project_id, pod_id)
+    m = _request("PATCH", f"{path}/{user_id}", json={"role": _norm_role(role)})
+    return {"scope": label, "user_id": user_id, "role": m["role"]}
+
+
+@mcp.tool()
+def remove_member(user_id: str, org_slug: str = "", project_id: str = "", pod_id: str = "") -> dict:
+    """Remove a member from an org, project, or pod. Identify the member by
+    user_id (from list_members) and give exactly one scope."""
+    _, path, label = _members_path(org_slug, project_id, pod_id)
+    _request("DELETE", f"{path}/{user_id}")
+    return {"scope": label, "removed": user_id, "ok": True}
 
 
 @mcp.tool()
@@ -446,32 +584,30 @@ def create_note(
     title: str,
     content_md: str,
     org_slug: str = "",
+    project_id: str = "",
     pod_id: str = "",
     description: str = "",
     tags: list[str] | None = None,
     attachments: list[dict] | None = None,
 ) -> dict:
-    """Create a NOTE resource — team knowledge in markdown. Provide either
-    org_slug (org-level note, inherited everywhere) or pod_id (pod-level).
+    """Create a NOTE resource — team knowledge in markdown. Target exactly one
+    scope: org_slug (whole org), project_id (a project + its pods), or pod_id
+    (one pod). A note is inherited by everything beneath its scope and notifies
+    that scope's members (org/project/pod).
 
     Args:
         title: note title.
         content_md: markdown body.
         org_slug: target org slug for an org-level note.
-        pod_id: target pod id for a pod-level note (overrides org_slug).
+        project_id: target project id for a project-level note.
+        pod_id: target pod id for a pod-level note (most specific wins).
         description: one-line summary shown on cards.
         tags: e.g. ["process", "rag"].
         attachments: typed media, each {kind, url, title?, caption?} where kind
             is "link" | "image" | "video" | "file". Pass public URLs; to attach
             a local file, call upload_file first and use the returned file_url.
     """
-    if pod_id:
-        scope = {"scope_type": "POD", "scope_id": pod_id}
-    elif org_slug:
-        org = _request("GET", f"/api/orgs/{org_slug}")
-        scope = {"scope_type": "ORG", "scope_id": org["id"]}
-    else:
-        raise SkillShareError("Provide org_slug or pod_id")
+    scope = _resource_scope(org_slug, project_id, pod_id)
     r = _request(
         "POST",
         "/api/resources",
@@ -690,20 +826,22 @@ def scan_local(sources: list[str] | None = None, notes_dir: str = "", include_di
 def push_artifact(
     fingerprint: str,
     org_slug: str = "",
+    project_id: str = "",
     pod_id: str = "",
     title: str = "",
     description: str = "",
     tags: list[str] | None = None,
 ) -> dict:
     """Push a local artifact (found via scan_local) to SkillShare. Secrets are
-    redacted automatically before upload. Provide a target scope (org_slug or
-    pod_id) and optionally override the auto-derived title/description/tags with
-    better ones you drafted from the preview.
+    redacted automatically before upload. Target exactly one scope (org_slug,
+    project_id, or pod_id) and optionally override the auto-derived
+    title/description/tags with better ones you drafted from the preview.
 
     Args:
         fingerprint: the candidate's fingerprint from scan_local (prefix ok).
         org_slug: target org for an org-level resource.
-        pod_id: target pod (overrides org_slug).
+        project_id: target project for a project-level resource.
+        pod_id: target pod (most specific wins).
         title/description/tags: optional overrides for the resource metadata.
     """
     rows = _reconciled(None, "", include_dismissed=True)
@@ -718,13 +856,7 @@ def push_artifact(
         payload["description"] = description
     if tags is not None:
         payload["tags"] = tags
-    if pod_id:
-        payload.update({"scope_type": "POD", "scope_id": pod_id})
-    elif org_slug:
-        org = _request("GET", f"/api/orgs/{org_slug}")
-        payload.update({"scope_type": "ORG", "scope_id": org["id"]})
-    else:
-        raise SkillShareError("Provide org_slug or pod_id")
+    payload.update(_resource_scope(org_slug, project_id, pod_id))
     created = _request("POST", "/api/resources", json=payload)
     _request("POST", "/api/local-state", json={
         "fingerprint": match["fingerprint"], "kind": c.kind, "status": "pushed",
@@ -736,6 +868,7 @@ def push_artifact(
 def import_from_github(
     url: str,
     org_slug: str = "",
+    project_id: str = "",
     pod_id: str = "",
     select: list[str] | None = None,
     dry_run: bool = False,
@@ -749,26 +882,21 @@ def import_from_github(
 
     Workflow: call with dry_run=True first to see what was detected — each item
     has a `fingerprint`, `type`, `title`, `source_path`, and `redaction` findings.
-    Then call again with a scope (org_slug or pod_id) and optionally `select` (a
-    list of fingerprints) to import a subset. Re-importing is idempotent: items
-    already present in the scope are skipped, not duplicated.
+    Then call again with a scope (org_slug, project_id, or pod_id) and optionally
+    `select` (a list of fingerprints) to import a subset. Re-importing is
+    idempotent: items already present in the scope are skipped, not duplicated.
 
     Args:
         url: github.com/owner/repo (optionally /tree/<ref>/<subpath>).
         org_slug: target org for an org-level import.
-        pod_id: target pod (overrides org_slug).
+        project_id: target project for a project-level import.
+        pod_id: target pod (most specific wins).
         select: fingerprints to import; omit/empty to import everything detected.
         dry_run: only detect and return the candidates; import nothing.
     """
     if dry_run:
         return _request("POST", "/api/resources/github/preview", json={"url": url})
-    if pod_id:
-        scope = {"scope_type": "POD", "scope_id": pod_id}
-    elif org_slug:
-        org = _request("GET", f"/api/orgs/{org_slug}")
-        scope = {"scope_type": "ORG", "scope_id": org["id"]}
-    else:
-        raise SkillShareError("Provide org_slug or pod_id (or dry_run=True to preview)")
+    scope = _resource_scope(org_slug, project_id, pod_id)
     result = _request(
         "POST", "/api/resources/github/import",
         json={"url": url, "select": select or [], **scope},
