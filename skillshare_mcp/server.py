@@ -130,6 +130,7 @@ def _summary(r: dict) -> dict:
         "version": r["version"],
         "tags": r["tags"],
         "scope": r.get("scope_label") or r["scope_type"],
+        "visibility": r.get("visibility"),
         "author": (r.get("author") or {}).get("username"),
         "stars": r["stars_count"],
         "is_public": r["is_public"],
@@ -589,11 +590,16 @@ def create_note(
     description: str = "",
     tags: list[str] | None = None,
     attachments: list[dict] | None = None,
+    visibility: str = "",
 ) -> dict:
     """Create a NOTE resource — team knowledge in markdown. Target exactly one
     scope: org_slug (whole org), project_id (a project + its pods), or pod_id
-    (one pod). A note is inherited by everything beneath its scope and notifies
-    that scope's members (org/project/pod).
+    (one pod).
+
+    `visibility` (audience) is who can READ it: "pod" | "project" | "org".
+    Omit it to default to the home scope — a pod note is pod-members-only by
+    default; widen to "project" or "org" so other pods / the whole org see it.
+    Notifications go to whoever the audience is.
 
     Args:
         title: note title.
@@ -606,8 +612,11 @@ def create_note(
         attachments: typed media, each {kind, url, title?, caption?} where kind
             is "link" | "image" | "video" | "file". Pass public URLs; to attach
             a local file, call upload_file first and use the returned file_url.
+        visibility: "pod" | "project" | "org" — the audience (default: home scope).
     """
     scope = _resource_scope(org_slug, project_id, pod_id)
+    if visibility:
+        scope["visibility"] = visibility.upper()
     r = _request(
         "POST",
         "/api/resources",
@@ -622,6 +631,27 @@ def create_note(
         },
     )
     return _summary(r)
+
+
+@mcp.tool()
+def move_resource(resource_id: str, org_slug: str = "", project_id: str = "", pod_id: str = "", visibility: str = "") -> dict:
+    """Move a resource to another home scope (pod ⇆ project ⇆ org). Give exactly
+    one destination (org_slug / project_id / pod_id). The audience re-defaults to
+    the destination scope unless `visibility` ("pod"|"project"|"org") is given.
+    Requires you to be the author or an org admin, and a member at the destination."""
+    scope = _resource_scope(org_slug, project_id, pod_id)
+    body = {"scope_type": scope["scope_type"], "scope_id": scope["scope_id"]}
+    if visibility:
+        body["visibility"] = visibility.upper()
+    return _summary(_request("POST", f"/api/resources/{resource_id}/move", json=body))
+
+
+@mcp.tool()
+def set_resource_visibility(resource_id: str, visibility: str) -> dict:
+    """Change who can read a resource without moving it: visibility is
+    "pod" | "project" | "org" (must be allowed by the resource's home scope —
+    e.g. an org-scoped resource is always org-wide). Author or org admin only."""
+    return _summary(_request("PATCH", f"/api/resources/{resource_id}", json={"visibility": visibility.upper()}))
 
 
 @mcp.tool()
@@ -831,6 +861,7 @@ def push_artifact(
     title: str = "",
     description: str = "",
     tags: list[str] | None = None,
+    visibility: str = "",
 ) -> dict:
     """Push a local artifact (found via scan_local) to SkillShare. Secrets are
     redacted automatically before upload. Target exactly one scope (org_slug,
@@ -857,6 +888,8 @@ def push_artifact(
     if tags is not None:
         payload["tags"] = tags
     payload.update(_resource_scope(org_slug, project_id, pod_id))
+    if visibility:
+        payload["visibility"] = visibility.upper()
     created = _request("POST", "/api/resources", json=payload)
     _request("POST", "/api/local-state", json={
         "fingerprint": match["fingerprint"], "kind": c.kind, "status": "pushed",
