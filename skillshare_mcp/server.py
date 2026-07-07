@@ -88,7 +88,10 @@ class SkillShareError(Exception):
 
 def _request(method: str, path: str, *, json: dict | None = None, params: dict | None = None) -> Any:
     t = _token()
-    headers = {"Authorization": f"Bearer {t}"} if t else {}
+    # Identify this client so the API attributes activity to MCP (spec §7).
+    headers = {"X-SkillShare-Client": "mcp"}
+    if t:
+        headers["Authorization"] = f"Bearer {t}"
     with httpx.Client(base_url=_base_url(), timeout=30) as client:
         res = client.request(method, path, json=json, params=params, headers=headers)
     if res.status_code == 401:
@@ -304,6 +307,12 @@ def use_resource(resource_id: str) -> dict:
     r = _request("GET", f"/api/resources/{resource_id}") if _token() else _request(
         "GET", f"/api/public/resources/{resource_id}"
     )
+    # Best-effort usage ping so this shows on the activity timeline (spec §7).
+    if _token():
+        try:
+            _request("POST", f"/api/resources/{resource_id}/use")
+        except SkillShareError:
+            pass
     rtype = r.get("type")
     title = r.get("title", "resource")
     content = r.get("content_md") or ""
@@ -394,12 +403,24 @@ def whoami() -> dict:
         unread = (_request("GET", "/api/notifications/unread_count") or {}).get("count", 0)
     except SkillShareError:
         unread = 0
+    ent = {}
+    try:
+        ent = _request("GET", "/api/auth/me/entitlements") or {}
+    except SkillShareError:
+        pass
     return {
         "username": u["username"],
         "display_name": u["display_name"],
         "email": u["email"],
         "is_publisher": u.get("is_publisher", False),
         "unread_notifications": unread,
+        # Plan + entitlements (spec §2) so the agent knows the user's tier/limits
+        # and whether MCP access is included in their plan.
+        "plan": ent.get("plan", u.get("plan", "FREE")),
+        "plan_name": ent.get("plan_name"),
+        "mcp_included": ent.get("mcp_included"),
+        "publisher_resource_quota": ent.get("publisher_resource_quota"),
+        "publisher_resource_used": ent.get("publisher_resource_used"),
     }
 
 
