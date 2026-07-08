@@ -15,6 +15,7 @@ Public marketplace tools work without signing in; org/pod tools require it.
 
 import json as _json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -51,6 +52,17 @@ mcp = FastMCP(
         "note markdown), and create_note/star/import to write. Resources can "
         "carry typed attachments (link/image/video/file): upload_file stores a "
         "local file and returns a URL you can pass to create_note's attachments.\n\n"
+        "DISCOVER (guided search) — when the user describes a NEED or gives a repo "
+        "instead of naming a resource (\"find me something to review PRs\", \"what "
+        "should I add for this repo?\"), use the iterative flow, not a single "
+        "search: call discover_marketplace(need, repo?, keywords=[…]) — it fans the "
+        "need out into several searches and returns skills / MCP servers / notes "
+        "ranked with a match rationale. Present them grouped, ask the user what to "
+        "narrow, then call discover_marketplace again with a tightened need and "
+        "exclude_ids for rejects. When they've converged, call "
+        "recommend_marketplace(need, repo, candidate_ids=[…]) for a final best-fit "
+        "shortlist, then offer use_resource (apply now) or import_resource (save to "
+        "an org). Use plain search_marketplace only for a direct one-shot lookup.\n\n"
         "PROACTIVE INBOX — do this WITHOUT being asked: at the start of each "
         "conversation (and again after you publish or create resources), call "
         "check_updates(unread_only=True). If it returns any items, tell the user "
@@ -135,6 +147,10 @@ def _summary(r: dict) -> dict:
         "scope": r.get("scope_label") or r["scope_type"],
         "visibility": r.get("visibility"),
         "author": (r.get("author") or {}).get("username"),
+        # Marketplace attribution: org for org-published resources, else the
+        # author. Lets the agent say "published by <org>" vs "by @<user>".
+        "published_by": (r.get("owner") or {}).get("name"),
+        "publisher_kind": (r.get("owner") or {}).get("kind"),
         "stars": r["stars_count"],
         "is_public": r["is_public"],
         "updated_at": str(r["updated_at"]),
@@ -267,6 +283,249 @@ def search_marketplace(
     params = {"q": query or None, "type": resource_type or None, "tag": tag or None, "sort": sort}
     rows = _request("GET", "/api/public/resources", params={k: v for k, v in params.items() if v})
     return [_summary(r) for r in rows]
+
+
+# --------------------------------------------------------------------------- #
+# Iterative marketplace discovery
+#
+# search_marketplace is a single-shot query. discover_marketplace is the guided,
+# multi-query flow: the agent describes what the user needs (and optionally their
+# repo/stack), the tool fans that out into several searches, merges + ranks the
+# hits, and returns them grouped with a match rationale + a next-step hint so the
+# agent can iterate with the user and then call recommend_marketplace to finalize.
+# --------------------------------------------------------------------------- #
+
+_DISCOVERY_STOPWORDS = {
+    "a", "an", "the", "and", "or", "for", "with", "to", "of", "in", "on", "is", "my",
+    "your", "our", "we", "i", "need", "want", "help", "using", "use", "that", "this",
+    "it", "be", "can", "should", "how", "do", "have", "has", "some", "any", "me",
+    "please", "would", "like", "get", "make", "build", "repo", "repository", "project",
+    "code", "com", "github", "https", "http", "www", "git", "app", "src", "lib",
+}
+
+
+def _disc_tokens(text: str) -> list[str]:
+    """Lowercased alnum tokens minus stopwords — the vocabulary we match on."""
+    out: list[str] = []
+    for m in re.findall(r"[a-zA-Z0-9]+", (text or "").lower()):
+        if len(m) >= 2 and m not in _DISCOVERY_STOPWORDS and m not in out:
+            out.append(m)
+    return out
+
+
+def _repo_signal(repo: str) -> list[str]:
+    """Search signal from a repo reference — the owner/name from a GitHub URL, or
+    just the tokens of a free-text stack description."""
+    if not repo:
+        return []
+    m = re.search(r"github\.com/([^/]+)/([^/#?]+)", repo)
+    if m:
+        return _disc_tokens(f"{m.group(1)} {m.group(2).replace('.git', '')}")
+    return _disc_tokens(repo)
+
+
+def _facet_queries(need: str, keywords: list[str] | None, repo: str) -> list[str]:
+    """The set of searches to run: the whole need (best single relevance query),
+    each explicit keyword the agent decomposed, and the repo's own name/stack.
+    Deduped and capped so discovery stays a handful of round-trips, not dozens."""
+    queries: list[str] = []
+    if need and need.strip():
+        queries.append(need.strip())
+    for k in keywords or []:
+        k = (k or "").strip()
+        if k and k.lower() not in [q.lower() for q in queries]:
+            queries.append(k)
+    repo_sig = _repo_signal(repo)
+    if repo_sig:
+        joined = " ".join(repo_sig[:4])
+        if joined and joined.lower() not in [q.lower() for q in queries]:
+            queries.append(joined)
+    return queries[:6]
+
+
+def _match_score(r: dict, want: set[str]) -> tuple[float, list[str]]:
+    """Weighted token overlap between the user's need and a resource, plus a
+    light popularity nudge. Title matches count most, then tags, then description.
+    Returns (score, the distinct terms that matched) for a human-readable why."""
+    title_tok = set(_disc_tokens(r.get("title", "")))
+    tag_tok = {t for tag in (r.get("tags") or []) for t in _disc_tokens(tag)}
+    desc_tok = set(_disc_tokens(r.get("description", "")))
+    score = 0.0
+    matched: list[str] = []
+    for w in want:
+        if w in title_tok:
+            score += 3.0
+            matched.append(w)
+        elif w in tag_tok:
+            score += 2.0
+            matched.append(w)
+        elif w in desc_tok:
+            score += 1.0
+            matched.append(w)
+    # Popularity tiebreaker — never outweighs a real content match.
+    score += min(float(r.get("stars_count", 0)), 100.0) / 100.0
+    return score, matched
+
+
+def _gather(queries: list[str], resource_type: str, exclude: set[str]) -> dict[str, dict]:
+    """Run each facet query against the public marketplace and merge the hits into
+    one id→resource map (first-seen wins; a resource found by several queries is
+    naturally reinforced when we score it against the full need)."""
+    merged: dict[str, dict] = {}
+    for q in queries:
+        params = {"q": q, "sort": "relevance"}
+        if resource_type:
+            params["type"] = resource_type
+        try:
+            rows = _request("GET", "/api/public/resources", params=params)
+        except SkillShareError:
+            continue
+        for r in rows or []:
+            rid = r.get("id")
+            if rid and rid not in exclude and rid not in merged:
+                merged[rid] = r
+    return merged
+
+
+def _disc_summary(r: dict, want: set[str]) -> dict:
+    s = _summary(r)
+    score, matched = _match_score(r, want)
+    s["match_score"] = round(score, 2)
+    s["matched_on"] = matched
+    return s
+
+
+@mcp.tool()
+def discover_marketplace(
+    need: str,
+    repo: str = "",
+    keywords: list[str] | None = None,
+    resource_type: str = "",
+    exclude_ids: list[str] | None = None,
+    limit: int = 8,
+) -> dict:
+    """Guided, iterative marketplace discovery — the tool to reach for when the
+    user describes a problem ("I need something to review PRs", or a repo URL)
+    rather than naming a resource.
+
+    It fans the need out into several marketplace searches (the whole description,
+    each keyword you decomposed it into, and the repo's name/stack), merges and
+    de-duplicates the hits, then ranks every candidate against the FULL need and
+    returns them grouped into skills / MCP servers / notes, each with a
+    `match_score` and the `matched_on` terms so you can explain the fit.
+
+    Use it iteratively: present the grouped candidates to the user, ask what to
+    narrow or change, then call this again with a tightened `need`/`keywords` and
+    `exclude_ids` for the ones they rejected. When they've converged, call
+    `recommend_marketplace` for a final best-fit shortlist.
+
+    Args:
+        need: natural-language description of what the user is trying to do.
+        repo: optional GitHub URL or a short description of their stack — sharpens
+              results toward their ecosystem.
+        keywords: optional list of focused search terms you extracted from `need`
+              (e.g. ["code review", "github", "linting"]) — each becomes a query.
+        resource_type: optionally restrict to "SKILL", "MCP", or "NOTE".
+        exclude_ids: resource ids to drop (ones already shown or rejected).
+        limit: max candidates per group (default 8).
+    """
+    if not (need and need.strip()) and not keywords and not repo:
+        raise SkillShareError("Describe what the user needs (`need`), or pass keywords / a repo.")
+    queries = _facet_queries(need, keywords, repo)
+    want = set(_disc_tokens(need)) | {t for k in (keywords or []) for t in _disc_tokens(k)} | set(_repo_signal(repo))
+    merged = _gather(queries, resource_type.upper().strip(), set(exclude_ids or []))
+    scored = sorted(
+        (_disc_summary(r, want) for r in merged.values()),
+        key=lambda s: s["match_score"],
+        reverse=True,
+    )
+    groups = {"skills": [], "mcp_servers": [], "notes": []}
+    bucket = {"SKILL": "skills", "MCP": "mcp_servers", "NOTE": "notes"}
+    for s in scored:
+        g = bucket.get(s["type"])
+        if g and len(groups[g]) < max(1, limit):
+            groups[g].append(s)
+    total = sum(len(v) for v in groups.values())
+    return {
+        "need": need,
+        "queries_run": queries,
+        "counts": {k: len(v) for k, v in groups.items()},
+        "candidates": groups,
+        "total": total,
+        "next_step": (
+            "Show the user these candidates grouped by kind, using matched_on/match_score to explain "
+            "why each fits. Then ITERATE: ask what to narrow or change and call discover_marketplace "
+            "again with a tightened need/keywords plus exclude_ids for rejects. When they've converged, "
+            "call recommend_marketplace(need, repo, candidate_ids=[…]) for a final best-fit pick, then "
+            "offer to use_resource (apply now) or import_resource (save to an org)."
+            if total
+            else "No matches for those terms. Broaden the need, try different keywords, or drop resource_type."
+        ),
+    }
+
+
+@mcp.tool()
+def recommend_marketplace(
+    need: str,
+    repo: str = "",
+    candidate_ids: list[str] | None = None,
+    top: int = 3,
+) -> dict:
+    """Final step of discovery — pick the best-fit resources for the user and
+    explain why. Call this once the user has converged (typically after one or
+    more `discover_marketplace` rounds).
+
+    Pass the shortlist the user liked as `candidate_ids` (recommended), or omit it
+    to have this run a fresh discovery from `need`/`repo` first. Returns a ranked
+    list of `top` picks, each with a plain-language `why`, its `match_score`, and
+    ready-to-run next actions (apply inline vs. save to an org).
+
+    Args:
+        need: the user's requirement, in natural language.
+        repo: optional GitHub URL / stack description to bias the fit.
+        candidate_ids: the resource ids to choose among (from earlier discovery).
+        top: how many recommendations to return (default 3).
+    """
+    want = set(_disc_tokens(need)) | set(_repo_signal(repo))
+    pool: list[dict] = []
+    if candidate_ids:
+        for rid in candidate_ids:
+            try:
+                pool.append(_request("GET", f"/api/public/resources/{rid}"))
+            except SkillShareError:
+                continue
+    else:
+        pool = list(_gather(_facet_queries(need, None, repo), "", set()).values())
+    if not pool:
+        raise SkillShareError("Nothing to recommend — pass candidate_ids or a need that returns results.")
+    ranked = sorted((( _match_score(r, want), r) for r in pool), key=lambda x: x[0][0], reverse=True)
+    recs = []
+    for (score, matched), r in ranked[: max(1, top)]:
+        title = r.get("title", "resource")
+        kind = {"SKILL": "skill", "MCP": "MCP server", "NOTE": "note"}.get(r.get("type"), "resource")
+        why = (
+            f"Best-fit {kind} for “{need.strip()}”"
+            + (f" — matches on {', '.join(matched[:5])}" if matched else "")
+            + f". {r.get('stars_count', 0)}★."
+        )
+        s = _summary(r)
+        s.update({
+            "match_score": round(score, 2),
+            "why": why,
+            "apply_now": f"call use_resource('{r['id']}') to apply it in this conversation",
+            "save_to_org": f"skillshare import {r['id']}  (or call import_resource)",
+        })
+        recs.append(s)
+    return {
+        "need": need,
+        "considered": len(pool),
+        "recommendations": recs,
+        "note": (
+            "Explain the top pick to the user in your own words (lead with `why`), then offer to apply it "
+            "now with use_resource or save it to one of their orgs with import_resource. Mention the "
+            "runners-up briefly so they can choose."
+        ),
+    }
 
 
 @mcp.tool()
